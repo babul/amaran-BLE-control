@@ -347,6 +347,8 @@ Examples:
   } else {
     await runDirect(cmd, cmdArgs, light);
   }
+  // noble keeps native BLE handles alive after disconnect; force exit.
+  process.exit(0);
 }
 
 main().catch(err => {
