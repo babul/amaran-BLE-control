@@ -16,7 +16,7 @@
     "daemon:logs": "bash scripts/launchd.sh logs",
     "daemon:restart": "bash scripts/launchd.sh restart",
     "amaran": "tsx src/cli.ts",
-    "mesh:toggle": "bash scripts/toggle.sh",
+    "mesh:toggle": "bun scripts/toggle.mjs",
     "mesh:on": "tsx src/cli.ts on",
     "mesh:off": "tsx src/cli.ts off",
     "mesh:brightness": "tsx src/cli.ts brightness",

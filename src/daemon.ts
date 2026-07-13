@@ -175,82 +175,108 @@ async function runDaemon() {
     return [light.address];
   }
 
+  // ── Serialize BLE work ───────────────────────────────────────────────────────
+  // One radio, one proxy characteristic: overlapping writes would interleave.
+  // Everything that touches the mesh goes through here, in submission order.
+  let bleChain: Promise<unknown> = Promise.resolve();
+  function enqueueBLE<T>(fn: () => Promise<T>): Promise<T> {
+    const run = bleChain.then(fn, fn); // a failed predecessor must not block the queue
+    bleChain = run.catch(() => {});
+    return run;
+  }
+
+  // Bumped by every command. A background refresh checks it between fixtures and
+  // bails if a newer command has arrived — its state nudge is already stale, and
+  // finishing it would make the new command wait behind ~640ms of dead work.
+  let commandEpoch = 0;
+
   // ── Run a command sent from a CLI client ─────────────────────────────────────
   async function runCommand(req: { cmd: string; args: string[]; light?: string }): Promise<string> {
     const { cmd, args, light } = req;
+
+    // These never touch the radio — answer without queueing behind BLE work.
+    if (cmd === "ping") return "pong";
+    if (cmd === "lights") return JSON.stringify(ctrl.lights);
+
     const targets = resolveTargets(light);
+    const epoch = ++commandEpoch;
 
-    for (const addr of targets) {
-      const lightName = ctrl.lights.find(l => l.address === addr)?.name ?? (addr === 0xffff ? "all" : `0x${addr.toString(16)}`);
+    await enqueueBLE(async () => {
+      for (const addr of targets) {
+        const lightName = ctrl.lights.find(l => l.address === addr)?.name ?? (addr === 0xffff ? "all" : `0x${addr.toString(16)}`);
 
-      const haB = (pct: number) => Math.round((Math.max(0, Math.min(100, pct)) / 100) * 255);
-      const kToM = (k: number) => Math.round(1000000 / k);
+        const haB = (pct: number) => Math.round((Math.max(0, Math.min(100, pct)) / 100) * 255);
+        const kToM = (k: number) => Math.round(1000000 / k);
 
-      switch (cmd) {
-        case "on":
-          console.log(`Turning ${lightName} ON`);
-          await ctrl.setOnOffBlast(addr, true);
-          updateState(addr, { state: "ON" });
-          break;
-        case "off":
-          console.log(`Turning ${lightName} OFF`);
-          await ctrl.setOnOffBlast(addr, false);
-          updateState(addr, { state: "OFF" });
-          break;
-        case "brightness": {
-          const pct = parseFloat(args[0]);
-          if (isNaN(pct)) throw new Error("brightness requires a number 0-100");
-          console.log(`${lightName} brightness → ${pct}%`);
-          await ctrl.setBrightness(addr, pct);
-          updateState(addr, { state: "ON", brightness: haB(pct) });
-          break;
+        switch (cmd) {
+          case "on":
+            console.log(`Turning ${lightName} ON`);
+            await ctrl.setOnOffBlast(addr, true);
+            updateState(addr, { state: "ON" });
+            break;
+          case "off":
+            console.log(`Turning ${lightName} OFF`);
+            await ctrl.setOnOffBlast(addr, false);
+            updateState(addr, { state: "OFF" });
+            break;
+          case "brightness": {
+            const pct = parseFloat(args[0]);
+            if (isNaN(pct)) throw new Error("brightness requires a number 0-100");
+            console.log(`${lightName} brightness → ${pct}%`);
+            await ctrl.setBrightness(addr, pct);
+            updateState(addr, { state: "ON", brightness: haB(pct) });
+            break;
+          }
+          case "cct": {
+            const b = parseFloat(args[0]);
+            const k = parseFloat(args[1]);
+            const gm = args[2] ? parseFloat(args[2]) : 0;
+            if (isNaN(b) || isNaN(k)) throw new Error("cct requires brightness and kelvin");
+            console.log(`${lightName} CCT → ${b}%, ${k}K, GM ${gm}`);
+            await ctrl.setCCT(addr, b, k, gm);
+            updateState(addr, { state: "ON", brightness: haB(b), color_mode: "color_temp", color_temp: kToM(k), hs_color: undefined });
+            break;
+          }
+          case "hsi":
+          case "hsl": {
+            const b = parseFloat(args[0]);
+            const h = parseFloat(args[1]);
+            const s = parseFloat(args[2]);
+            if (isNaN(b) || isNaN(h) || isNaN(s)) throw new Error("hsi requires brightness, hue, saturation");
+            console.log(`${lightName} HSI → ${b}%, hue ${h}°, sat ${s}%`);
+            await ctrl.setHSL(addr, b, h, s);
+            updateState(addr, { state: "ON", brightness: haB(b), color_mode: "hs", hs_color: [h, s], color_temp: undefined });
+            break;
+          }
+          case "stop":
+            console.log("Stop requested. Disconnecting...");
+            await ctrl.disconnect();
+            cleanup();
+            process.exit(0);
+          default:
+            throw new Error(`Unknown command: ${cmd}`);
         }
-        case "cct": {
-          const b = parseFloat(args[0]);
-          const k = parseFloat(args[1]);
-          const gm = args[2] ? parseFloat(args[2]) : 0;
-          if (isNaN(b) || isNaN(k)) throw new Error("cct requires brightness and kelvin");
-          console.log(`${lightName} CCT → ${b}%, ${k}K, GM ${gm}`);
-          await ctrl.setCCT(addr, b, k, gm);
-          updateState(addr, { state: "ON", brightness: haB(b), color_mode: "color_temp", color_temp: kToM(k), hs_color: undefined });
-          break;
-        }
-        case "hsi":
-        case "hsl": {
-          const b = parseFloat(args[0]);
-          const h = parseFloat(args[1]);
-          const s = parseFloat(args[2]);
-          if (isNaN(b) || isNaN(h) || isNaN(s)) throw new Error("hsi requires brightness, hue, saturation");
-          console.log(`${lightName} HSI → ${b}%, hue ${h}°, sat ${s}%`);
-          await ctrl.setHSL(addr, b, h, s);
-          updateState(addr, { state: "ON", brightness: haB(b), color_mode: "hs", hs_color: [h, s], color_temp: undefined });
-          break;
-        }
-        case "ping":
-          return "pong";
-        case "stop":
-          console.log("Stop requested. Disconnecting...");
-          await ctrl.disconnect();
-          cleanup();
-          process.exit(0);
-          break;
-        case "lights":
-          return JSON.stringify(ctrl.lights);
-        default:
-          throw new Error(`Unknown command: ${cmd}`);
       }
-    }
+    });
     // Nudge fixtures to broadcast their new state so the ESP32 bridge / desktop
     // app pick up the change immediately rather than on the next poll. Mirrors
     // the firmware's schedule_refresh().
+    //
+    // Deliberately NOT awaited: the fixtures already acted on the command above —
+    // this only refreshes *observers* of their state. Awaiting it added ~640ms to
+    // every reply (one send + an 80ms settle per fixture), which is what made the
+    // CLI feel sluggish. It stays on the BLE queue, so ordering is still safe.
     if (["on", "off", "brightness", "cct", "hsi", "hsl"].includes(cmd)) {
       const refreshAddrs = targets.includes(0xffff)
         ? ctrl.lights.map((l: any) => l.address)
         : targets;
-      for (const a of refreshAddrs) {
-        await ctrl.statusRequest(a);
-        await new Promise(r => setTimeout(r, 80));
-      }
+      void enqueueBLE(async () => {
+        for (const a of refreshAddrs) {
+          if (commandEpoch !== epoch) return; // superseded — a newer command is waiting
+          await ctrl.statusRequest(a);
+          await new Promise(r => setTimeout(r, 80));
+        }
+      }).catch(e => console.error("Status refresh failed:", e.message));
     }
     return "ok";
   }
