@@ -8,13 +8,18 @@
  */
 
 import * as crypto from "crypto";
+import * as fs from "fs";
+import * as path from "path";
 // @ts-ignore
 import noble from "@abandonware/noble";
 import type { Config, LightConfig } from "./config.js";
 import * as telink from "./telink.js";
 
-// Provisioner address (0x0001 is standard for SIG mesh provisioner).
-const LOCAL_ADDRESS = 0x0001;
+// Address we send from, when lights.json doesn't override it. 0x0001 is the
+// standard SIG provisioner address — and the one the Amaran desktop app sends
+// from, so using it means fighting the app over a shared replay slot. Prefer
+// setting `localAddress` in lights.json to something nothing else uses.
+const DEFAULT_LOCAL_ADDRESS = 0x0001;
 const DEFAULT_TTL = 10;
 // Group "All" address — typical provisioner default, overridden by config if needed.
 const GROUP_ALL = 0xc000;
@@ -329,6 +334,52 @@ function parseIVIndexFromProxy(data: Buffer): number | null {
   return ivIndex;
 }
 
+// ─── Sequence number persistence ─────────────────────────────────────────────
+//
+// Mesh nodes implement replay protection: each fixture stores the highest SEQ it
+// has seen from our source address and silently discards anything at or below it.
+// A successful BLE write therefore tells us nothing — a replayed SEQ is dropped
+// with no error. The counter MUST be monotonic across restarts, forever.
+//
+// We persist a *reservation*, not the live counter: on startup we claim a block
+// of SEQ_BLOCK numbers and write the top of that block to disk before sending
+// anything. A crash loses at most the unused tail of the block, which is safe
+// (skipping numbers is fine; reusing them is not) and costs one write per block
+// rather than one per packet.
+
+const SEQ_MAX = 0xffffff; // 24-bit field — the hard protocol ceiling
+const SEQ_BLOCK = 10_000;
+const SEQ_LOW_WATER = 250_000; // start warning when this few remain
+const SEQ_STATE_PATH = path.join(process.cwd(), ".mesh-seq");
+
+// Keyed by source address: each address has its own replay slot on every fixture,
+// so each needs its own counter. Switching to a fresh address starts from zero.
+type SeqState = Record<string, number>;
+
+function readSeqState(): SeqState {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SEQ_STATE_PATH, "utf-8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {}; // no state file yet, or unreadable — treat as first run
+  }
+}
+
+function readPersistedSeq(src: number): number {
+  const n = readSeqState()[src.toString()];
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function persistSeq(src: number, value: number): void {
+  // Write-then-rename so a crash mid-write can't leave truncated JSON that would
+  // read back as "no state" and silently reintroduce the replay bug.
+  const state = readSeqState();
+  state[src.toString()] = value;
+  const tmp = `${SEQ_STATE_PATH}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  fs.renameSync(tmp, SEQ_STATE_PATH);
+}
+
 // ─── Controller class ────────────────────────────────────────────────────────
 
 export class MeshController {
@@ -336,8 +387,9 @@ export class MeshController {
   private dataIn: any = null;
   private dataOut: any = null;
   private ivIndex = 0;
-  // Random start in 12M–16M range: avoids replay rejection between successive runs.
-  private seq = parseInt(process.env.MESH_SEQ ?? '') || (12000000 + Math.floor(Math.random() * 4000000));
+  private seq: number;
+  private seqCeiling: number;
+  private readonly localAddress: number;
 
   private readonly aid: number;
   private readonly nid: number;
@@ -357,6 +409,35 @@ export class MeshController {
     this.aid = k4(this.appKey);
     this.relayHubUUID = config.relayHub; // MAC address stored as-is
     this.lights = config.lights;
+    this.localAddress = config.localAddress ?? DEFAULT_LOCAL_ADDRESS;
+
+    // Resume above every number we have ever sent *from this address*. MESH_SEQ can
+    // push the counter forward (never backward), to climb over a replay high-water
+    // mark someone else set — only needed on the shared provisioner address.
+    const envSeq = parseInt(process.env.MESH_SEQ ?? "", 10);
+    const start = Math.max(
+      readPersistedSeq(this.localAddress),
+      Number.isFinite(envSeq) ? envSeq : 0
+    );
+    if (start >= SEQ_MAX) {
+      throw new Error(
+        `Mesh sequence number exhausted for address 0x${this.localAddress.toString(16)} (${start} ≥ ${SEQ_MAX}).\n` +
+        `The 24-bit SEQ field has no room left, so every command would be dropped as a replay.\n` +
+        `Fix: pick an unused "localAddress" in lights.json — a fresh address has a fresh sequence space.`
+      );
+    }
+    this.seq = start;
+    this.seqCeiling = Math.min(start + SEQ_BLOCK, SEQ_MAX);
+    persistSeq(this.localAddress, this.seqCeiling);
+
+    const remaining = SEQ_MAX - this.seq;
+    if (remaining < SEQ_LOW_WATER) {
+      console.warn(
+        `WARNING: address 0x${this.localAddress.toString(16)} has only ${remaining.toLocaleString()} mesh sequence numbers left.\n` +
+        `         When they run out the lights will ignore every command.\n` +
+        `         Fix: set "localAddress" in lights.json to an unused address for a fresh sequence space.`
+      );
+    }
   }
 
   async connect(preferredMac?: string): Promise<boolean> {
@@ -524,7 +605,7 @@ export class MeshController {
     //    silently and stops responding, so whitelist it is.
     const setFilterPDU = buildProxyConfigPDU(
       this.nid, this.encKey, this.privKey,
-      this.nextSeq(), LOCAL_ADDRESS, this.ivIndex,
+      this.nextSeq(), this.localAddress, this.ivIndex,
       PROXY_CFG_SET_FILTER_TYPE,
       Buffer.from([PROXY_FILTER_WHITELIST])
     );
@@ -544,7 +625,7 @@ export class MeshController {
     //    Adding light addresses means the proxy will forward traffic addressed
     //    to those lights — including commands sent by other proxy clients
     //    (e.g. the Desktop app) that get relayed through our hub.
-    const addresses: number[] = [LOCAL_ADDRESS, 0xffff, GROUP_ALL];
+    const addresses: number[] = [this.localAddress, 0xffff, GROUP_ALL];
     for (const l of this.lights) {
       if (typeof l.address === "number") addresses.push(l.address);
     }
@@ -552,7 +633,7 @@ export class MeshController {
     for (let i = 0; i < addresses.length; i++) addrBuf.writeUInt16BE(addresses[i] & 0xffff, i * 2);
     const addAddrPDU = buildProxyConfigPDU(
       this.nid, this.encKey, this.privKey,
-      this.nextSeq(), LOCAL_ADDRESS, this.ivIndex,
+      this.nextSeq(), this.localAddress, this.ivIndex,
       PROXY_CFG_ADD_ADDRESSES,
       addrBuf
     );
@@ -565,7 +646,20 @@ export class MeshController {
   }
 
   private nextSeq(): number {
-    this.seq = (this.seq + 1) & 0xffffff;
+    this.seq++;
+    // Never wrap. Wrapping to 0 would put us below every fixture's replay
+    // high-water mark and silently break all control until the mesh IV index
+    // rotates — the failure this counter exists to prevent.
+    if (this.seq > SEQ_MAX) {
+      throw new Error(
+        `Mesh sequence number exhausted for address 0x${this.localAddress.toString(16)} (${SEQ_MAX}).\n` +
+        `Fix: pick an unused "localAddress" in lights.json — a fresh address has a fresh sequence space.`
+      );
+    }
+    if (this.seq >= this.seqCeiling) {
+      this.seqCeiling = Math.min(this.seq + SEQ_BLOCK, SEQ_MAX);
+      persistSeq(this.localAddress, this.seqCeiling);
+    }
     return this.seq;
   }
 
@@ -575,7 +669,7 @@ export class MeshController {
       const seq = this.nextSeq();
       const pdu = buildProxyPDU(
         this.appKey, this.aid, this.nid, this.encKey, this.privKey,
-        seq, LOCAL_ADDRESS, dst, this.ivIndex,
+        seq, this.localAddress, dst, this.ivIndex,
         opcode, params
       );
       if (i === 0) console.log(`  → dst=0x${dst.toString(16).padStart(4,"0")} opcode=0x${opcode.toString(16).padStart(4,"0")} try=${i+1}/${retries} payload=${pdu.toString("hex")}`);

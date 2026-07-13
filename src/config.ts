@@ -27,6 +27,12 @@ export interface Config {
   appKey: string;        // hex string, 32 chars
   relayHub: string;      // MAC address of the light to connect through as BLE Mesh Proxy
   lights: LightConfig[];
+  // Mesh unicast address we send *from*. Defaults to 0x0001, the provisioner
+  // address — which the Amaran desktop app also uses. Sharing it means sharing a
+  // replay-protection slot with the app: whichever sends a higher sequence number
+  // wins, and the other's messages are silently dropped as replays. Set this to an
+  // address nothing else uses (e.g. 0x7ffe) to get a private sequence space.
+  localAddress?: number;
   http?: HttpConfig;
   mqtt?: MqttConfig;
 }

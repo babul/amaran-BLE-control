@@ -13,3 +13,4 @@ lights.json
 # vendor/PyMeshSDK/PyMeshSDK.so
 *.xapk
 amaran/
+.mesh-seq
