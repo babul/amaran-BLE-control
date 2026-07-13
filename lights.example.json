@@ -2,6 +2,7 @@
   "netKey": "YOUR_NET_KEY_HEX_32_CHARS",
   "appKey": "YOUR_APP_KEY_HEX_32_CHARS",
   "relayHub": "A4:C1:38:13:41:38",
+  "localAddress": 32766,
   "lights": [
     {
       "key": "key",

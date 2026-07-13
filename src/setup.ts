@@ -125,6 +125,11 @@ async function main() {
   }
   config.lights = renamed;
 
+  // Send from our own address rather than 0x0001, which the amaran Desktop app
+  // also uses. Sharing it means sharing a replay-protection slot with the app,
+  // and whichever client falls behind on sequence numbers gets silently ignored.
+  config.localAddress ??= 0x7ffe;
+
   saveConfig(config);
 
   console.log(`\n✓ Saved to lights.json`);
