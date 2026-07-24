@@ -380,6 +380,19 @@ function persistSeq(src: number, value: number): void {
   fs.renameSync(tmp, SEQ_STATE_PATH);
 }
 
+// ─── Auto-reconnect tuning ───────────────────────────────────────────────────
+// The BLE link can die two ways: cleanly (noble fires 'disconnect' — sleep/wake,
+// the fixture rebooting, another client grabbing the proxy) or silently (macOS
+// drops the socket without an event — the failure that left a 9-day-old daemon
+// writing into the void). We cover the first with a disconnect listener and the
+// second with a watchdog that periodically probes the BLE link (via RSSI).
+const WATCHDOG_INTERVAL_MS = 30_000; // how often to probe the link for a silent stall
+const PROBE_TIMEOUT_MS = 3_000; // a live BLE connection answers a RSSI read in well under this
+const PROBE_STRIKES = 2; // consecutive failed probes before reconnecting — tolerate a
+                         // one-off BLE hiccup, act on a persistently unresponsive link
+const CONNECT_TIMEOUT_MS = 20_000; // cap one connect() attempt so a hung scan/GATT can't stall the loop
+const RECONNECT_MAX_DELAY_MS = 30_000; // backoff ceiling between reconnect attempts
+
 // ─── Controller class ────────────────────────────────────────────────────────
 
 export class MeshController {
@@ -390,6 +403,14 @@ export class MeshController {
   private seq: number;
   private seqCeiling: number;
   private readonly localAddress: number;
+
+  // Auto-reconnect state
+  private intentionalDisconnect = false;
+  private reconnecting = false;
+  private probeFailures = 0;   // consecutive failed liveness probes
+  private connectGeneration = 0; // bumped per connect() attempt; a superseded attempt
+                                 // must not commit or disconnect a shared peripheral
+  private watchdog: ReturnType<typeof setInterval> | null = null;
 
   private readonly aid: number;
   private readonly nid: number;
@@ -442,17 +463,46 @@ export class MeshController {
 
   async connect(preferredMac?: string): Promise<boolean> {
     const self = this;
+    // Identity of THIS attempt. A later connect() (or disconnect()) bumps the
+    // counter; a straggler whose GATT work finally unblocks then sees it's been
+    // superseded and neither commits nor disconnects the now-shared peripheral.
+    const gen = ++self.connectGeneration;
     return new Promise((resolve) => {
       // Normalize relay hub MAC for comparison
       const hubMac = self.relayHubUUID.toLowerCase().replace(/-/g, ":");
       const knownMacs = self.lights.map(l => l.mac.toLowerCase().replace(/-/g, ":"));
       console.log(`Scanning for lights (relay hub MAC: ${hubMac})...`);
       let found = false;
+      let settled = false;
+      let hubWait: ReturnType<typeof setTimeout> | undefined;
+      let noLightsTimer: ReturnType<typeof setTimeout> | undefined;
+      let overallTimer: ReturnType<typeof setTimeout> | undefined;
       const candidates = new Map<string, any>(); // normalized-addr → peripheral
 
-      noble.on("stateChange", async (state: string) => {
-        if (state === "poweredOn") await noble.startScanningAsync([], true);
+      // Resolve exactly once and stop the clocks. This single-settle guard is what
+      // lets the reconnect loop call connect() with no external timeout race:
+      // connect() always settles on its own (the overallTimer backstops a hung
+      // GATT op), so an abandoned attempt can never leak into the next one.
+      const finish = (v: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (hubWait) clearTimeout(hubWait);
+        if (noLightsTimer) clearTimeout(noLightsTimer);
+        if (overallTimer) clearTimeout(overallTimer);
+        resolve(v);
+      };
+
+      // Drop listeners from any prior connect() so repeated reconnects don't leak
+      // handlers onto the shared noble singleton (the old MaxListeners warning).
+      noble.removeAllListeners("stateChange");
+      noble.removeAllListeners("discover");
+
+      noble.on("stateChange", (state: string) => {
+        if (state === "poweredOn") noble.startScanningAsync([], true).catch(() => {});
       });
+      // On a reconnect the adapter is already powered on, so the transition above
+      // never fires — kick off the scan directly.
+      if ((noble as any).state === "poweredOn") noble.startScanningAsync([], true).catch(() => {});
 
       noble.on("discover", async (p: any) => {
         if (found) return;
@@ -475,8 +525,8 @@ export class MeshController {
 
         if (isHub) {
           found = true;
-          noble.stopScanningAsync();
-          doConnect(p, addr).then(resolve);
+          noble.stopScanningAsync().catch(() => {});
+          doConnect(p, addr).then(finish);
         }
       });
 
@@ -489,10 +539,10 @@ export class MeshController {
         "b3ed1263a9304e5132b3edfbb4c71aec", // Key Light
         "d16927ee947b5a0ced73358c29bc4bcd", // Back Light
       ];
-      const hubWait = setTimeout(async () => {
+      hubWait = setTimeout(async () => {
         if (found || candidates.size === 0) return;
         found = true;
-        await noble.stopScanningAsync();
+        await noble.stopScanningAsync().catch(() => {});
         let best = candidates.get(hubMac);
         if (!best) {
           for (const uuid of preferredHubUUIDs) {
@@ -501,44 +551,92 @@ export class MeshController {
         }
         if (!best) best = candidates.values().next().value;
         const addr = (best.address || best.id || "").toLowerCase().replace(/-/g, ":");
-        doConnect(best, addr).then(resolve);
+        doConnect(best, addr).then(finish);
       }, 5000);
 
-      setTimeout(async () => {
-        clearTimeout(hubWait);
+      noLightsTimer = setTimeout(async () => {
+        if (hubWait) clearTimeout(hubWait);
         if (!found) {
-          await noble.stopScanningAsync();
+          await noble.stopScanningAsync().catch(() => {});
           console.error("No Amaran lights found. Make sure the Amaran Desktop app is closed.");
-          resolve(false);
+          finish(false);
         }
       }, 15000);
 
+      // Backstop the whole attempt. Once a candidate is picked, the timers above no
+      // longer fire, so a GATT op that hangs in doConnect would otherwise stall
+      // connect() forever. This guarantees connect() resolves so the reconnect loop
+      // can back off and retry instead of wedging.
+      overallTimer = setTimeout(() => {
+        if (settled) return;
+        noble.stopScanningAsync().catch(() => {});
+        console.error("connect() timed out before a usable link was ready.");
+        finish(false);
+      }, CONNECT_TIMEOUT_MS);
+
       async function doConnect(p: any, addr: string): Promise<boolean> {
         console.log(`Connecting to ${p.advertisement.localName || addr} (${addr})...`);
+        // Work on locals and commit to self.* only once fully wired. If connect()
+        // has already given up (overallTimer fired → settled), drop this link
+        // instead of clobbering whatever the current/next attempt owns.
+        let dataOut: any = null;
+        // This attempt is void if connect() gave up (settled), a newer connect()
+        // superseded it (generation bumped), or disconnect() was requested.
+        const superseded = () => settled || self.connectGeneration !== gen || self.intentionalDisconnect;
+        const abandon = () => {
+          // Don't disconnect a peripheral something else may now own: a newer attempt
+          // that adopted this exact object (noble reuses them across scans), or one
+          // still bringing it up under a newer generation.
+          if (self.peripheral === p || self.connectGeneration !== gen) return;
+          const st = p.state;
+          if (st === "connected" || st === "connecting") {
+            try { void p.disconnectAsync().catch(() => {}); } catch {}
+          }
+        };
         try {
           await p.connectAsync();
-          self.peripheral = p;
 
           const { characteristics } = await p.discoverSomeServicesAndCharacteristicsAsync(
             [PROXY_SERVICE], [PROXY_DATA_IN, PROXY_DATA_OUT]
           );
 
+          let dataIn: any = null;
           for (const c of characteristics) {
-            if (c.uuid === PROXY_DATA_IN) self.dataIn = c;
-            if (c.uuid === PROXY_DATA_OUT) self.dataOut = c;
+            if (c.uuid === PROXY_DATA_IN) dataIn = c;
+            if (c.uuid === PROXY_DATA_OUT) dataOut = c;
           }
 
-          if (!self.dataIn || !self.dataOut) {
+          if (!dataIn || !dataOut) {
             console.error(`Mesh proxy chars not found. Run: npx tsx src/ble-scanner.ts connect ${addr}`);
+            abandon();
             return false;
           }
+          if (superseded()) { abandon(); return false; }
 
-          self.dataOut.on("data", (d: Buffer) => self.onNotify(d));
-          await self.dataOut.subscribeAsync();
+          dataOut.on("data", (d: Buffer) => self.onNotify(d));
+          await dataOut.subscribeAsync();
+          if (superseded()) { try { dataOut.removeAllListeners("data"); } catch {} abandon(); return false; }
+
+          // Commit atomically now that the link is fully usable.
+          self.peripheral = p;
+          self.dataIn = dataIn;
+          self.dataOut = dataOut;
           console.log(`Connected to ${p.advertisement.localName || addr}`);
+
+          // Heal the link automatically. A clean drop fires 'disconnect'; a silent
+          // stall is caught by the watchdog. Both funnel into triggerReconnect,
+          // which is idempotent, so it's safe if they race. Swallow the returned
+          // promise's rejection — an event handler must never throw unhandled.
+          self.intentionalDisconnect = false;
+          p.once("disconnect", () => { void self.triggerReconnect("peripheral disconnected"); });
+          self.startWatchdog();
           return true;
         } catch (err) {
           console.error("Connection error:", err);
+          // A throw mid-handshake can leave the peripheral GATT-connected; drop it
+          // so the next attempt can rediscover cleanly instead of leaking a link.
+          if (dataOut) { try { dataOut.removeAllListeners("data"); } catch {} }
+          abandon();
           return false;
         }
       }
@@ -722,9 +820,159 @@ export class MeshController {
     await this.setTelinkHSI(dst, hueDeg, satPercent, Math.round(brightnessPercent * 10));
   }
 
+  // ─── Auto-reconnect ──────────────────────────────────────────────────────────
+
+  private startWatchdog(): void {
+    if (this.watchdog) return; // one timer for the daemon's whole lifetime
+    this.watchdog = setInterval(() => this.watchdogTick(), WATCHDOG_INTERVAL_MS);
+  }
+
+  private async watchdogTick(): Promise<void> {
+    try {
+      if (this.reconnecting || !this.peripheral) return;
+      const probed = this.peripheral;
+      if (await this.probeLink()) { this.probeFailures = 0; return; }
+      // The link may have changed under us while the probe was in flight (a
+      // 'disconnect' fired and reconnected). Don't charge this failure to a
+      // different link, or a stale timeout could bank a strike on a healthy one.
+      if (this.reconnecting || this.peripheral !== probed) return;
+      // One failed probe is not proof — BLE has transient hiccups. Only reconnect
+      // once the link has ignored several probes in a row.
+      this.probeFailures++;
+      console.error(`Liveness probe failed (${this.probeFailures}/${PROBE_STRIKES}).`);
+      if (this.probeFailures >= PROBE_STRIKES) {
+        this.probeFailures = 0;
+        await this.triggerReconnect("link stopped responding to probes");
+      }
+    } catch (err: any) {
+      // setInterval swallows nothing — an escaped rejection here would crash the
+      // daemon. The next tick will retry.
+      console.error("Watchdog tick errored:", err?.message ?? err);
+    }
+  }
+
+  // Liveness at the BLE layer, not the mesh layer. Reading the connection RSSI
+  // tests the physical link to the proxy node, so it doesn't depend on the mesh
+  // answering — which fixtures do only unreliably when idle, and beacons arrive too
+  // sparsely to gate on. (It confirms the link, not the GATT write path end to end;
+  // the wedged link that motivated this feature took the whole connection down, RSSI
+  // included.) A live link fires 'rssiUpdate' in milliseconds; a dead one never does,
+  // so we time out and count a strike. The listener is always removed, so repeated
+  // probes can't leak handlers onto the peripheral.
+  private probeLink(): Promise<boolean> {
+    const p = this.peripheral;
+    if (!p) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const finishProbe = (alive: boolean) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { p.removeListener("rssiUpdate", onRssi); } catch {}
+        resolve(alive);
+      };
+      const onRssi = () => finishProbe(true);
+      const timer = setTimeout(() => finishProbe(false), PROBE_TIMEOUT_MS);
+      try {
+        p.once("rssiUpdate", onRssi);
+        p.updateRssi();
+      } catch {
+        finishProbe(false);
+      }
+    });
+  }
+
+  // Best-effort teardown of the current peripheral. Never awaits disconnectAsync:
+  // we often arrive here from the peripheral's own 'disconnect' event, and on an
+  // already-dead peripheral that promise can hang forever. Also strips the
+  // listeners we added so repeated reconnects don't accumulate them.
+  private teardownPeripheral(): void {
+    const p = this.peripheral;
+    const out = this.dataOut;
+    this.peripheral = null;
+    this.dataIn = null;
+    this.dataOut = null;
+    this.beaconReceived = false; // force a fresh beacon/IV index on the next link
+    if (out) { try { out.removeAllListeners("data"); } catch {} }
+    if (p) {
+      try { p.removeAllListeners("disconnect"); } catch {}
+      // Only disconnect a link that's actually up. Calling disconnectAsync on an
+      // already-dead peripheral leaves a promise pending forever waiting on a
+      // 'disconnect' event that will never come (and a retained one-shot listener).
+      const st = p.state;
+      if (st === "connected" || st === "connecting") {
+        try { void Promise.resolve(p.disconnectAsync()).catch(() => {}); } catch {}
+      }
+    }
+  }
+
+  // Single entry point for both failure paths. The `reconnecting` guard makes it
+  // idempotent, so a 'disconnect' event and a watchdog probe firing together only
+  // start one backoff loop. The whole body is wrapped so `reconnecting` is always
+  // cleared — a throw that latched it true would deafen us to every later failure.
+  private async triggerReconnect(reason: string): Promise<void> {
+    if (this.intentionalDisconnect || this.reconnecting) return;
+    this.reconnecting = true;
+    this.probeFailures = 0;
+    console.error(`BLE link lost (${reason}) — reconnecting...`);
+
+    try {
+      let delay = 1000;
+      while (!this.intentionalDisconnect) {
+        this.teardownPeripheral(); // clear any stale/half-open link from a prior try
+        try {
+          // connect() is self-bounded (its overallTimer guarantees it resolves), so
+          // no external timeout race is needed here — which is what kept abandoned
+          // attempts from leaking into later ones.
+          const ok = await this.connect();
+          if (ok && this.peripheral) {
+            // beaconReceived was cleared by teardownPeripheral() at the loop top, so
+            // it now reflects only beacons seen on THIS fresh link.
+            await this.waitForBeacon(4000);
+            await this.setupProxyFilter();
+            // Verify the handshake produced a live link: a beacon arrived (inbound
+            // works) and the peripheral is still connected — the same bar the
+            // daemon's initial connect clears. The RSSI watchdog takes over from here.
+            if (this.peripheral?.state === "connected" && this.beaconReceived) {
+              console.log("Reconnected — proxy filter restored.");
+              return;
+            }
+          }
+        } catch (err: any) {
+          console.error(`Reconnect attempt errored: ${err?.message ?? err}`);
+        }
+        console.error(`Reconnect failed; retrying in ${delay / 1000}s.`);
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, RECONNECT_MAX_DELAY_MS);
+      }
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
   async disconnect(): Promise<void> {
-    if (this.peripheral) {
-      await this.peripheral.disconnectAsync();
+    this.intentionalDisconnect = true; // suppress the reconnect loop for a real shutdown
+    this.connectGeneration++; // void any in-flight connect() so it can't re-commit after us
+    if (this.watchdog) { clearInterval(this.watchdog); this.watchdog = null; }
+    const p = this.peripheral;
+    const out = this.dataOut;
+    this.peripheral = null;
+    this.dataIn = null;
+    this.dataOut = null;
+    if (out) { try { out.removeAllListeners("data"); } catch {} }
+    if (p) {
+      try { p.removeAllListeners("disconnect"); } catch {}
+      const st = p.state;
+      if (st === "connected" || st === "connecting") {
+        // Bound the disconnect so shutdown can't wedge on a dead link — a hung
+        // disconnectAsync is exactly what left an un-killable orphan daemon before.
+        try {
+          await Promise.race([
+            Promise.resolve(p.disconnectAsync()).catch(() => {}),
+            new Promise(r => setTimeout(r, 3000)),
+          ]);
+        } catch {}
+      }
       console.log("Disconnected");
     }
   }
