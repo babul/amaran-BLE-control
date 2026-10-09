@@ -133,7 +133,7 @@ async function main() {
   saveConfig(config);
 
   console.log(`\n✓ Saved to lights.json`);
-  console.log(`  Relay hub: ${config.lights.find(l => l.uuid === config!.relayHub)?.name ?? config.relayHub}`);
+  console.log(`  Relay hub: ${config.lights.find(l => l.mac.toUpperCase() === config!.relayHub.toUpperCase())?.name ?? config.relayHub}`);
   console.log(`  ${config.lights.length} light(s) configured`);
   console.log("\nTry it:  npm run mesh:on");
 
