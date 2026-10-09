@@ -50,5 +50,9 @@
     "@types/node": "^25.0.10",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "node-gyp": "^13.1.0",
+    "@mapbox/node-pre-gyp": "^2.0.3"
   }
 }
